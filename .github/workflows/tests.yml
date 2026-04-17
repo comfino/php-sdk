@@ -1,0 +1,92 @@
+name: Tests
+
+on:
+    push:
+        branches: [ master, main, develop ]
+    pull_request:
+        branches: [ master, main, develop ]
+
+jobs:
+    test:
+        runs-on: ${{ matrix.os }}
+        strategy:
+            fail-fast: false
+            matrix:
+                os: [ ubuntu-latest ]
+                php: [ '8.1', '8.2', '8.3', '8.4' ]
+                dependency-version: [ prefer-lowest, prefer-stable ]
+
+        name: PHP ${{ matrix.php }} - ${{ matrix.dependency-version }} - ${{ matrix.os }}
+
+        steps:
+            -   name: Checkout code
+                uses: actions/checkout@v4
+
+            -   name: Setup PHP
+                uses: shivammathur/setup-php@v2
+                with:
+                    php-version: ${{ matrix.php }}
+                    extensions: json, sodium, zlib
+                    coverage: none
+
+            -   name: Validate composer.json and composer.lock
+                run: composer validate --strict
+
+            -   name: Cache Composer packages
+                id: composer-cache
+                uses: actions/cache@v4
+                with:
+                    path: vendor
+                    key: ${{ runner.os }}-php-${{ matrix.php }}-${{ hashFiles('**/composer.lock') }}
+                    restore-keys: |
+                        ${{ runner.os }}-php-${{ matrix.php }}-
+
+            -   name: Install dependencies
+                run: composer update --${{ matrix.dependency-version }} --prefer-dist --no-interaction --no-progress
+
+            -   name: Run test suite
+                run: composer test
+
+    coverage:
+        runs-on: ubuntu-latest
+        name: Code Coverage
+
+        steps:
+            -   name: Checkout code
+                uses: actions/checkout@v4
+
+            -   name: Setup PHP with Xdebug
+                uses: shivammathur/setup-php@v2
+                with:
+                    php-version: '8.3'
+                    extensions: json, sodium, zlib
+                    coverage: xdebug
+
+            -   name: Install dependencies
+                run: composer update --prefer-stable --prefer-dist --no-interaction --no-progress
+
+            -   name: Run tests with coverage
+                run: XDEBUG_MODE=coverage vendor/bin/phpunit --testsuite Unit --coverage-clover coverage.xml
+
+            -   name: Check minimum coverage threshold (70%)
+                run: |
+                    php -r '
+                    $xml = simplexml_load_file("coverage.xml");
+                    $metrics = $xml->project->metrics;
+                    $statements = (int) $metrics["statements"];
+                    $covered = (int) $metrics["coveredstatements"];
+                    $pct = $statements > 0 ? round($covered / $statements * 100, 2) : 0;
+                    printf("Coverage: %.2f%%\n", $pct);
+                    if ($pct < 70) {
+                        printf("ERROR: Coverage %.2f%% is below the 70%% minimum.\n", $pct);
+                        exit(1);
+                    }
+                    echo "Coverage check passed.\n";
+                    '
+
+            -   name: Upload coverage to Codecov
+                uses: codecov/codecov-action@v4
+                with:
+                    files: ./coverage.xml
+                    fail_ci_if_error: false
+                    verbose: true

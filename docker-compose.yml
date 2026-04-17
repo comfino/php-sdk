@@ -1,0 +1,26 @@
+services:
+    php-sdk:
+        build:
+            context: ./
+            dockerfile: config/docker/Dockerfile
+        working_dir: /php-sdk
+        tty: true
+        volumes:
+            - ./:/php-sdk
+            - ~/.composer:/home/comfino/.composer
+
+    php-sdk-coverage:
+        build:
+            context: ./
+            dockerfile: config/docker/Dockerfile
+            args:
+                WITH_XDEBUG: "true"
+        working_dir: /php-sdk
+        tty: true
+        environment:
+            XDEBUG_MODE: coverage
+        volumes:
+            - ./:/php-sdk
+            - ~/.composer:/home/comfino/.composer
+        profiles:
+            - coverage

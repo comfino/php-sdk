@@ -1,0 +1,37 @@
+name: Code style
+
+on:
+    push:
+        branches: [ master, main, develop ]
+    pull_request:
+        branches: [ master, main, develop ]
+
+jobs:
+    phpcs:
+        runs-on: ubuntu-latest
+        name: PHP CodeSniffer (PSR-12)
+
+        steps:
+            -   name: Checkout code
+                uses: actions/checkout@v4
+
+            -   name: Setup PHP
+                uses: shivammathur/setup-php@v2
+                with:
+                    php-version: '8.3'
+                    extensions: json, sodium, zlib
+                    coverage: none
+
+            -   name: Cache Composer packages
+                uses: actions/cache@v4
+                with:
+                    path: vendor
+                    key: ${{ runner.os }}-php-8.3-cs-${{ hashFiles('**/composer.lock') }}
+                    restore-keys: |
+                        ${{ runner.os }}-php-8.3-cs-
+
+            -   name: Install dependencies
+                run: composer install --prefer-dist --no-interaction --no-progress
+
+            -   name: Run PHP_CodeSniffer
+                run: vendor/bin/phpcs
