@@ -1,0 +1,48 @@
+name: Static analysis
+
+on:
+    push:
+        branches: [ master, main, develop ]
+    pull_request:
+        branches: [ master, main, develop ]
+
+jobs:
+    phpstan:
+        runs-on: ubuntu-latest
+        name: PHPStan (level 6)
+
+        steps:
+            -   name: Checkout code
+                uses: actions/checkout@v5
+
+            -   name: Setup PHP
+                uses: shivammathur/setup-php@v2
+                with:
+                    php-version: '8.3'
+                    extensions: json, sodium, zlib
+                    coverage: none
+
+            -   name: Cache Composer packages
+                uses: actions/cache@v5
+                with:
+                    path: vendor
+                    key: ${{ runner.os }}-php-8.3-stan-${{ hashFiles('**/composer.lock') }}
+                    restore-keys: |
+                        ${{ runner.os }}-php-8.3-stan-
+
+            -   name: Configure Composer OAuth for private GitHub packages
+                env:
+                    STAGING_DEPENDENCIES_TOKEN: ${{ secrets.STAGING_DEPENDENCIES_TOKEN }}
+                run: |
+                    if [ -n "$STAGING_DEPENDENCIES_TOKEN" ]; then
+                        composer config --global github-oauth.github.com "$STAGING_DEPENDENCIES_TOKEN"
+                    fi
+
+            -   name: Use source install for internal packages (avoids Packagist download counter)
+                run: composer config preferred-install.comfino/php-api-client source
+
+            -   name: Install dependencies
+                run: composer install --prefer-dist --no-interaction --no-progress
+
+            -   name: Run PHPStan
+                run: vendor/bin/phpstan analyse --no-progress

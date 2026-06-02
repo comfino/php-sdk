@@ -1,0 +1,28 @@
+#!/bin/bash
+
+# Runs PHPStan analysis with JSON error format by default.
+# Pass --error-format=<format> to override (e.g. --error-format=table).
+# Usage:
+#   ./bin/phpstan-json.sh                             # JSON output to stdout
+#   ./bin/phpstan-json.sh > phpstan.json              # JSON output to file
+#   ./bin/phpstan-json.sh --error-format=table        # human-readable table
+
+ARGS=("$@")
+HAS_FORMAT=false
+
+for arg in "${ARGS[@]}"; do
+    if [[ "$arg" == --error-format=* ]]; then
+        HAS_FORMAT=true
+        break
+    fi
+done
+
+if [[ "$HAS_FORMAT" == false ]]; then
+    ARGS=("--error-format=json" "${ARGS[@]}")
+fi
+
+if command -v docker-compose > /dev/null ; then
+    docker-compose exec php-sdk php ./vendor/bin/phpstan analyse "${ARGS[@]}"
+else
+    php -d memory_limit=512M ./vendor/bin/phpstan analyse "${ARGS[@]}"
+fi

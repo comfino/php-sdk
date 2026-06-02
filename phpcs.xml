@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<ruleset name="Comfino PHP SDK">
+    <description>PSR-12 coding standard.</description>
+
+    <file>src</file>
+    <file>tests</file>
+
+    <arg name="basepath" value="."/>
+    <arg name="extensions" value="php"/>
+    <arg value="sp"/>
+
+    <rule ref="PSR12"/>
+</ruleset>

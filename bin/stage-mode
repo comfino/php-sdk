@@ -1,0 +1,4 @@
+#!/bin/sh
+# Quick switch to STAGING mode (private php-api-client-staging GitHub repo via PAT).
+# Shortcut for: ./bin/switch-dependencies.sh stage [--pat TOKEN]
+exec "$(dirname "$0")/switch-dependencies.sh" stage "$@"
