@@ -1,0 +1,862 @@
+<?php
+
+/**
+ * ComfinoPay PHP SDK
+ *
+ * Backend routines for e-commerce platforms integration with the ComfinoPay payment gateway API.
+ *
+ * @package Comfino\Backend\Log
+ * @author Artur Kozubski <a.kozubski@artkosoft.pl>
+ * @copyright Copyright (c) 2026 by ComfinoPay sp. z o.o.
+ * @license https://opensource.org/licenses/BSD-3-Clause BSD 3-Clause License
+ * @link https://github.com/comfino/php-sdk
+ */
+
+declare(strict_types=1);
+
+namespace Comfino\Backend\Log;
+
+use Comfino\Api\ClientInterface;
+use Comfino\Api\Dto\Plugin\ErrorCategory;
+use Comfino\Api\Dto\Plugin\ErrorSeverity;
+use Comfino\Api\Dto\Plugin\OperationContext;
+use Comfino\Api\Dto\Plugin\ShopPluginError;
+use Comfino\Api\Exception\AuthorizationError;
+use Comfino\Api\Exception\RequestValidationError;
+use Comfino\Api\Exception\TooManyRequests;
+use Comfino\Api\HttpErrorDetailsInterface;
+use Comfino\Api\Request\ReportShopPluginError;
+use Comfino\Api\Retry\ErrorClassifier;
+use Comfino\Api\Serializer\Json;
+use Comfino\Api\SerializerInterface;
+use Comfino\Auth\ExceptionSanitizer;
+use Comfino\Backend\Clock\ClockInterface;
+use Comfino\Backend\Clock\SystemClock;
+use Comfino\Backend\FileUtils;
+use Comfino\Backend\Queue\OutboundRequestQueue;
+use Comfino\Backend\Queue\ReportErrorHandler;
+use Exception;
+use Psr\Log\LoggerInterface;
+use Throwable;
+
+/**
+ * ErrorLogger class for logging errors to a file.
+ */
+final class ErrorLogger extends Logger
+{
+    private const CATCH_ERRORS_MASK = E_ERROR | E_RECOVERABLE_ERROR | E_PARSE;
+    private const ERROR_TYPES = [
+        E_ERROR => 'E_ERROR',
+        E_WARNING => 'E_WARNING',
+        E_PARSE => 'E_PARSE',
+        E_NOTICE => 'E_NOTICE',
+        E_CORE_ERROR => 'E_CORE_ERROR',
+        E_CORE_WARNING => 'E_CORE_WARNING',
+        E_COMPILE_ERROR => 'E_COMPILE_ERROR',
+        E_COMPILE_WARNING => 'E_COMPILE_WARNING',
+        E_USER_ERROR => 'E_USER_ERROR',
+        E_USER_WARNING => 'E_USER_WARNING',
+        E_USER_NOTICE => 'E_USER_NOTICE',
+        E_RECOVERABLE_ERROR => 'E_RECOVERABLE_ERROR',
+        E_DEPRECATED => 'E_DEPRECATED',
+        E_USER_DEPRECATED => 'E_USER_DEPRECATED',
+    ];
+
+    /** Environment keys promoted to dedicated ShopPluginError fields (removed from the environment array). */
+    private const VERSION_ENV_KEYS = ['plugin_version', 'platform_version', 'shop_version', 'php_version'];
+
+    /** @var array<string, self> One instance per tenant scope, keyed by the scope string. */
+    private static array $instances = [];
+    /** @var array<string, LoggerInterface> One PSR-3 logger per tenant scope, keyed by the scope string. */
+    private static array $loggers = [];
+
+    private bool $globalHandlersRegistered = false;
+    private bool $shutdownHandlerRegistered = false;
+
+    /** @var callable|null Exception handler registered before this logger's one. */
+    private $previousExceptionHandler = null;
+
+    /** "file:line" of the exception already reported by the exception handler and rethrown. */
+    private ?string $rethrownExceptionLocation = null;
+    private bool $verboseLocalLog = true;
+    private ?SensitiveDataProcessor $textSanitizer = null;
+
+    /**
+     * Private constructor to enforce the per-scope instance pattern.
+     *
+     * @param ClientInterface $apiClient API client instance
+     * @param string $logFilePath Path to the log file
+     * @param string $host Shop host name
+     * @param string $platform Shop platform name
+     * @param string $modulePath Path to the module directory
+     * @param array<string, mixed> $environment Supplementary environment variables (version keys promoted out)
+     * @param string $pluginVersion ComfinoPay plugin version
+     * @param string $platformVersion E-commerce platform version
+     * @param string $phpVersion PHP runtime version
+     * @param ErrorMessageNormalizer $normalizer Strips dynamic parts from messages/stack traces before transmission
+     * @param OutboundRequestQueue|null $outboundQueue Optional outbound request queue for fire-and-forget delivery
+     * @param SerializerInterface $serializer Serializer for the queue payload encoding
+     * @param ClockInterface $clock Clock for the error occurrence timestamp
+     * @param string $scope Tenant scope this instance belongs to
+     */
+    private function __construct(
+        private readonly ClientInterface $apiClient,
+        private readonly string $logFilePath,
+        private readonly string $host,
+        private readonly string $platform,
+        private readonly string $modulePath,
+        private readonly array $environment,
+        private readonly string $pluginVersion,
+        private readonly string $platformVersion,
+        private readonly string $phpVersion,
+        private readonly ErrorMessageNormalizer $normalizer,
+        private readonly ?OutboundRequestQueue $outboundQueue = null,
+        private readonly SerializerInterface $serializer = new Json(),
+        private readonly ClockInterface $clock = new SystemClock(),
+        private readonly string $scope = ''
+    ) {
+    }
+
+    /**
+     * Retrieves a per-scope instance of the ErrorLogger.
+     *
+     * The version-bearing keys (plugin_version, platform_version / shop_version, php_version) are extracted from
+     * $environment and promoted to dedicated {@see ShopPluginError} fields; the remaining keys are kept as
+     * supplementary debug data.
+     *
+     * A distinct instance is kept for each $scope. Without that, the first tenant to call this method in a long-lived
+     * process owned the reporting identity for every tenant after it: their errors were reported under the first
+     * tenant's host, platform, environment and plugin version, and sent with the first tenant's API key. The default
+     * empty scope preserves the original single-instance behavior for the single-shop plugins that do not need tenant
+     * isolation.
+     *
+     * @param ClientInterface $apiClient API client instance
+     * @param string $logFilePath Path to the log file
+     * @param string $host Shop host name
+     * @param string $platform Shop platform name
+     * @param string $modulePath Path to the module directory
+     * @param array<string, mixed> $environment Environment variables (version keys are promoted out)
+     * @param OutboundRequestQueue|null $outboundQueue When provided, error reports are enqueued as pure fire-and-forget
+     *                                                 instead of being sent inline. The queue must have a
+     *                                                 {@see ReportErrorHandler} registered (done automatically by
+     *                                                 {@see OutboundRequestQueueFactory})
+     * @param SerializerInterface|null $serializer Serializer for the queue payload encoding; defaults to JSON
+     * @param ClockInterface|null $clock Injectable clock for the error occurrence timestamp; defaults to SystemClock
+     * @param string $scope Tenant scope discriminator (empty string = global/default scope)
+     *
+     * @return self The instance bound to $scope
+     */
+    public static function getInstance(
+        ClientInterface $apiClient,
+        string $logFilePath,
+        string $host,
+        string $platform,
+        string $modulePath,
+        array $environment,
+        ?OutboundRequestQueue $outboundQueue = null,
+        ?SerializerInterface $serializer = null,
+        ?ClockInterface $clock = null,
+        string $scope = ''
+    ): self {
+        if (!isset(self::$instances[$scope])) {
+            $pluginVersion = (string) ($environment['plugin_version'] ?? '');
+            $platformVersion = (string) ($environment['platform_version'] ?? $environment['shop_version'] ?? '');
+            $phpVersion = (string) ($environment['php_version'] ?? '');
+
+            $supplementaryEnv = array_diff_key($environment, array_flip(self::VERSION_ENV_KEYS));
+
+            self::$instances[$scope] = new self(
+                $apiClient,
+                $logFilePath,
+                $host,
+                $platform,
+                $modulePath,
+                $supplementaryEnv,
+                $pluginVersion,
+                $platformVersion,
+                $phpVersion,
+                new ErrorMessageNormalizer(),
+                $outboundQueue,
+                $serializer ?? new Json(),
+                $clock ?? new SystemClock(),
+                $scope
+            );
+        }
+
+        return self::$instances[$scope];
+    }
+
+    /**
+     * Initializes the ErrorLogger with a custom logger instance for the given scope.
+     *
+     * The logger is per scope for the same reason the instance is: a shared destination means one tenant's errors land
+     * in another tenant's log file, which is both a support problem and a data-separation one.
+     *
+     * @param LoggerInterface $logger Custom logger instance
+     * @param string $scope Tenant scope discriminator (empty string = global/default scope)
+     */
+    public static function init(LoggerInterface $logger, string $scope = ''): void
+    {
+        self::$loggers[$scope] = $logger;
+    }
+
+    /**
+     * Returns the scopes that currently hold a cached instance.
+     *
+     * Diagnostics for the retention of every scope-addressed class in the SDK shares: the cache keeps the first
+     * instance built for a scope and never evicts it, so a host that builds per request must release per request.
+     * Asserting this is empty at the end of a unit of work turns a forgotten `reset()` into a failing test rather
+     * than a slow leak.
+     *
+     * @return string[] Scope discriminators, in insertion order
+     */
+    public static function scopes(): array
+    {
+        return array_keys(self::$instances);
+    }
+
+    /**
+     * Returns how many scopes hold a cached instance.
+     */
+    public static function scopeCount(): int
+    {
+        return count(self::$instances);
+    }
+
+    /**
+     * Drops cached instances and their loggers, unregistering any global handlers they installed.
+     *
+     * @param string|null $scope When given, only the instance bound to this scope is dropped; when null (default), all
+     *                           cached instances (every scope) are dropped.
+     */
+    public static function reset(?string $scope = null): void
+    {
+        if ($scope === null) {
+            foreach (self::$instances as $instance) {
+                $instance->unregisterGlobalHandlers();
+            }
+
+            self::$instances = [];
+            self::$loggers = [];
+
+            return;
+        }
+
+        if (isset(self::$instances[$scope])) {
+            self::$instances[$scope]->unregisterGlobalHandlers();
+        }
+
+        unset(self::$instances[$scope], self::$loggers[$scope]);
+    }
+
+    /**
+     * Returns the tenant scope this instance is bound to.
+     */
+    public function getScope(): string
+    {
+        return $this->scope;
+    }
+
+    /**
+     * Returns the PSR-3 logger registered for this instance's scope.
+     *
+     * @return LoggerInterface|null The scope's logger, or null when none was registered
+     */
+    public function getLogger(): ?LoggerInterface
+    {
+        return self::$loggers[$this->scope] ?? null;
+    }
+
+    /**
+     * Reports an error to the ComfinoPay API.
+     *
+     * Caller location (class::method@file:line) is captured automatically from the call stack and stored in
+     * environment['caller'] for debugging. It does NOT appear in $errorMessage, keeping the message clean for
+     * fingerprinting. The classification ({@see ErrorCategory}, {@see ErrorSeverity}, {@see OperationContext}) is
+     * supplied explicitly so the API side never has to infer it from message substrings.
+     *
+     * @param ErrorCategory $category Structured technical category — never guessed from text
+     * @param ErrorSeverity $severity Severity hint for the API classification pipeline
+     * @param OperationContext $context What the plugin was doing when the error occurred
+     * @param string $errorCode PHP error level (E_WARNING), exception class (TypeError), or HTTP status code (500)
+     * @param string $errorMessage The error text — dynamic parts are normalized before transmission
+     * @param string|null $apiRequestUrl Full URL for debug (host + query params)
+     * @param string|null $apiRequest Request body
+     * @param string|null $apiResponse Response body
+     * @param string|null $stackTrace PHP stack trace (shop-specific path prefixes are stripped before transmission)
+     */
+    public function sendError(
+        ErrorCategory $category,
+        ErrorSeverity $severity,
+        OperationContext $context,
+        string $errorCode,
+        string $errorMessage,
+        ?string $apiRequestUrl = null,
+        ?string $apiRequest = null,
+        ?string $apiResponse = null,
+        ?string $stackTrace = null,
+        int $contextDepth = 0
+    ): void {
+        // Capture the occurrence timestamp immediately — before any queue delay or processing.
+        $occurredAt = $this->clock->now();
+
+        if (preg_match('/Error .*in |Exception .*in /', $errorMessage) &&
+            !str_contains(self::normalizePath($errorMessage), self::normalizePath($this->modulePath))
+        ) {
+            // Ignore errors and exceptions outside the module directory and SDK code.
+            return;
+        }
+
+        /* Capture caller location as supplementary debug info — kept out of error_message so the message stays clean
+           for fingerprinting. */
+        $callEnv = array_merge($this->environment, [
+            'caller' => $this->formatContext($this->extractCallerContext($contextDepth)),
+        ]);
+
+        [$errorMessage, $stackTrace, $apiRequest, $apiResponse] = $this->sanitizeForReport($errorMessage, $stackTrace, $apiRequest, $apiResponse);
+
+        $normalizedMessage = $this->normalizer->normalizeMessage($errorMessage);
+        $normalizedTrace = $stackTrace !== null ? $this->normalizer->normalizeStackTrace($stackTrace) : null;
+
+        $error = new ShopPluginError(
+            $this->host,
+            $this->platform,
+            $this->pluginVersion,
+            $this->platformVersion,
+            $this->phpVersion,
+            $category,
+            $severity,
+            $context,
+            $errorCode,
+            $normalizedMessage,
+            $callEnv,
+            ReportShopPluginError::extractApiEndpoint($apiRequestUrl),
+            $apiRequestUrl,
+            $apiRequest,
+            $apiResponse,
+            $normalizedTrace,
+            $occurredAt
+        );
+
+        $logPrefix = "[{$category->value}][{$context->value}]";
+        $logMessage = $apiRequestUrl !== null ? "$errorMessage\nAPI URL: $apiRequestUrl" : $errorMessage;
+        $logContext = $this->buildLocalLogContext($error, $apiRequest, $apiResponse, $stackTrace);
+
+        if (getenv('COMFINO_DEV_ENV') === 'TRUE' && getenv('COMFINO_FORCE_ERRORS_SENDING') !== 'TRUE') {
+            // Dev environment with sending disabled: local log only.
+            $this->logError($logPrefix, $logMessage, $logContext);
+        } elseif ($this->outboundQueue !== null) {
+            /* Queue path (preferred): pure fire-and-forget — zero inline blocking. The local log is the immediate
+               record; the drain delivers to the API asynchronously. */
+            $this->outboundQueue->enqueue(
+                ReportErrorHandler::OPERATION_TYPE,
+                $error->toQueuePayload($this->serializer),
+                /* The logger's scope is the queue's tenant: an error report is this merchant's outbound traffic, so it
+                   belongs in this merchant's queue partition and must not be paced by another merchant's backlog. */
+                $this->scope !== '' ? $this->scope : null
+            );
+
+            $this->logError($logPrefix, $logMessage, $logContext);
+        } else {
+            // Legacy path: direct synchronous API call, unchanged for platforms not yet using the queue.
+            try {
+                $this->apiClient->sendLoggedError($error);
+            } catch (Throwable) {
+                $this->logError($logPrefix, $logMessage, $logContext);
+            }
+        }
+    }
+
+    /**
+     * Whether a caught exception is a platform error worth reporting. False for outcomes that are the shop's or the shopper's input rather
+     * than a defect: a request the API rejected as invalid (HTTP 400 and the other 4xx validation outcomes; a 429 is a {@see TooManyRequests},
+     * not one of them) and an authorization failure (a configuration problem the merchant fixes by correcting the key).
+     *
+     * A {@see \Comfino\Api\Exception\ResponseValidationError} is reportable: since the API client classifies by status first, it now
+     * means a success response that broke the contract, not a proxy error page.
+     *
+     * Opt-in policy: {@see sendError()} does not call it. The recommended sequence for a host that reports a caught exception is
+     * `isReportable()` -> `resolveSeverity()` -> `sendError()`.
+     */
+    public static function isReportable(Throwable $error): bool
+    {
+        if ($error instanceof AuthorizationError) {
+            return false;
+        }
+
+        return !$error instanceof RequestValidationError;
+    }
+
+    /**
+     * Severity for a caught exception: {@see ErrorSeverity::Warning} for a transient failure (timeout, network error, HTTP 5xx or 429, see
+     * {@see ErrorClassifier::isTransient()}) and for a failure the request declared idempotent (a cancellation of an order that is gone or
+     * already cancelled); $default for everything else, an unknown throwable included - a `TypeError` in host code is never a warning.
+     *
+     * @param Throwable $error The caught exception
+     * @param ErrorSeverity $default Severity for a failure that is neither transient nor idempotent
+     */
+    public static function resolveSeverity(Throwable $error, ErrorSeverity $default = ErrorSeverity::Error): ErrorSeverity
+    {
+        if (
+            ($error instanceof HttpErrorDetailsInterface && $error->isIdempotentFailure()) ||
+            (new ErrorClassifier())->isTransient($error)
+        ) {
+            return ErrorSeverity::Warning;
+        }
+
+        return $default;
+    }
+
+    /**
+     * Sets whether the local log line carries the request and response bodies and the stack trace.
+     *
+     * On by default. Turn it off outside debug mode: the line then carries a `report_id` instead, which identifies
+     * the report sent to ComfinoPay. The report itself is unaffected.
+     */
+    public function setVerboseLocalLog(bool $verboseLocalLog): void
+    {
+        $this->verboseLocalLog = $verboseLocalLog;
+    }
+
+    /**
+     * Locally logs an error message with the specified prefix.
+     *
+     * Structured data goes into the PSR-3 context rather than the message, so a log processor such as
+     * {@see SensitiveDataProcessor} can see it. Without a PSR-3 logger the context is appended to the line as JSON.
+     *
+     * @param string $errorPrefix Error prefix
+     * @param string $errorMessage Error message
+     * @param array<string, mixed> $context PSR-3 context
+     */
+    public function logError(string $errorPrefix, string $errorMessage, array $context = []): void
+    {
+        $line = "$errorPrefix: $errorMessage";
+        $fileLine = $context !== []
+            ? $line . ' ' . json_encode($context, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR)
+            : $line;
+
+        if (($logger = $this->getLogger()) !== null) {
+            try {
+                $logger->error($line, $context);
+            } catch (Exception $e) {
+                if (FileUtils::isWritable($this->logFilePath)) {
+                    FileUtils::append($this->logFilePath, $fileLine);
+                    FileUtils::append($this->logFilePath, "Logger error: {$e->getMessage()} in {$e->getFile()}:{$e->getLine()}");
+                }
+            }
+        } elseif (FileUtils::isWritable($this->logFilePath)) {
+            FileUtils::append($this->logFilePath, $fileLine);
+        }
+    }
+
+    /**
+     * Retrieves the error log with the specified number of lines.
+     *
+     * @param int $numLines Number of lines to retrieve
+     *
+     * @return string Error log content
+     */
+    public function getErrorLog(int $numLines): string
+    {
+        $actualLogPath = $this->findActualLogFile($this->logFilePath);
+
+        if ($actualLogPath === null || !FileUtils::exists($actualLogPath)) {
+            return '';
+        }
+
+        return implode('', FileUtils::readLastLines($actualLogPath, $numLines));
+    }
+
+    /**
+     * Clears the error log.
+     *
+     * @return int The number of lines cleared
+     */
+    public function clearLogs(): int
+    {
+        return $this->clearLogFiles($this->logFilePath);
+    }
+
+    /**
+     * Handles PHP errors.
+     *
+     * @param int $errorType Error type
+     * @param string $errorMessage Error message
+     * @param string $file File where the error occurred
+     * @param int $line Line number where the error occurred
+     *
+     * @return bool False to allow the error to be handled by other error handlers
+     */
+    public function errorHandler(int $errorType, string $errorMessage, string $file, int $line): bool
+    {
+        if (!($errorType & self::CATCH_ERRORS_MASK)) {
+            return false;
+        }
+
+        $errorLevel = $this->getErrorTypeName($errorType);
+
+        $this->sendError(
+            ErrorCategory::PhpError,
+            $this->mapErrorSeverity($errorType),
+            OperationContext::Unknown,
+            $errorLevel,
+            "Error $errorLevel in $file:$line: $errorMessage"
+        );
+
+        return false;
+    }
+
+    /**
+     * Handles PHP exceptions.
+     *
+     * @param Throwable $exception Exception object
+     *
+     * @return void
+     *
+     * @throws Throwable
+     */
+    public function exceptionHandler(Throwable $exception): void
+    {
+        try {
+            $exceptionClass = (new \ReflectionClass($exception))->getShortName();
+
+            // Map the exception class to a structured ErrorCategory (most specific subtype first).
+            $category = match (true) {
+                $exception instanceof \ArgumentCountError => ErrorCategory::ExceptionArgCount,
+                $exception instanceof \TypeError => ErrorCategory::ExceptionTypeError,
+                $exception instanceof \ParseError => ErrorCategory::ExceptionParseError,
+                $exception instanceof \DivisionByZeroError => ErrorCategory::ExceptionDivision,
+                $exception instanceof \LogicException => ErrorCategory::ExceptionLogicError,
+                $exception instanceof \Error => ErrorCategory::ExceptionError,
+                // A Throwable that is not an \Error is necessarily an \Exception.
+                default => ErrorCategory::ExceptionGeneric,
+            };
+
+            $this->sendError(
+                $category,
+                ErrorSeverity::Error,
+                OperationContext::Unknown,
+                $exceptionClass,
+                sprintf(
+                    'Exception %s in %s:%d: %s',
+                    $exceptionClass,
+                    $exception->getFile(),
+                    $exception->getLine(),
+                    $exception->getMessage()
+                ),
+                null,
+                null,
+                null,
+                $exception->getTraceAsString()
+            );
+        } catch (Throwable $loggingFailure) {
+            error_log('Comfino exception logger failed: ' . $loggingFailure->getMessage());
+        }
+
+        /* PHP terminates the script when an exception handler returns, silently swallowing the error (blank page, no
+           fatal error in the log). Pass the exception on to the previously registered handler or let PHP report it. */
+        if ($this->previousExceptionHandler !== null) {
+            ($this->previousExceptionHandler)($exception);
+
+            return;
+        }
+
+        // Remember the rethrown exception, so shutdown() doesn't report the resulting "Uncaught" fatal error again.
+        $this->rethrownExceptionLocation = $exception->getFile() . ':' . $exception->getLine();
+
+        throw $exception;
+    }
+
+    /**
+     * Checks whether the fatal error is the "Uncaught" report of an exception already sent by {@see exceptionHandler()}.
+     *
+     * @param array{type: int, message: string, file: string, line: int} $error Result of error_get_last()
+     *
+     * @return bool True if reporting the error again would duplicate the earlier report
+     */
+    private function isRethrownExceptionError(array $error): bool
+    {
+        // A null location never equals the "file:line" string, so no separate null check is needed.
+        return $error['file'] . ':' . $error['line'] === $this->rethrownExceptionLocation && str_starts_with($error['message'], 'Uncaught ');
+    }
+
+    /**
+     * Normalizes directory separators to "/" so paths can be compared regardless of the OS (Linux, Windows).
+     *
+     * @param string $path Path or text containing paths
+     *
+     * @return string Path with unified separators
+     */
+    private static function normalizePath(string $path): string
+    {
+        return DIRECTORY_SEPARATOR === '/' ? $path : str_replace(DIRECTORY_SEPARATOR, '/', $path);
+    }
+
+    /**
+     * Installs this logger's PHP error, exception and shutdown handlers process-wide.
+     *
+     * **This is a process-global side effect, and it is opt-in for that reason.** The handlers it installs capture
+     * every fatal in the process, not only the ones raised by ComfinoPay code, and they report each one under *this*
+     * instance's identity — its host, platform, environment and API key. In a single-tenant plugin that is exactly
+     * right: the process serves one shop and dies at the end of the request. In a long-lived multi-tenant host it is
+     * not: a fatal raised while serving merchant B is reported as merchant A's, under merchant A's key, if merchant A's
+     * logger happened to register first.
+     *
+     * A multi-tenant host has two correct options. Either never call this and let the framework's own error handling
+     * do the reporting, or bracket each unit of work with {@see withGlobalHandlers()} so the handlers belong to the
+     * tenant currently being served. Never call it once at boot and leave it.
+     *
+     * Registration is idempotent per instance, and a second scope's logger may register its own handlers on top —
+     * PHP's handlers stack, and {@see unregisterGlobalHandlers()} pops exactly the frame this call pushed.
+     *
+     * The shutdown handler cannot be unregistered (PHP offers no counterpart to `register_shutdown_function()`), so it
+     * is disarmed instead: once {@see unregisterGlobalHandlers()} has run, {@see shutdown()} reports nothing.
+     */
+    public function registerGlobalHandlers(): void
+    {
+        if (getenv('COMFINO_DEV_ENV') === 'TRUE' && getenv('COMFINO_FORCE_ERRORS_HANDLING') !== 'TRUE') {
+            // Do not handle errors and exceptions in development environment unless forced.
+            return;
+        }
+
+        if ($this->globalHandlersRegistered) {
+            return;
+        }
+
+        set_error_handler([$this, 'errorHandler'], self::CATCH_ERRORS_MASK);
+        $this->previousExceptionHandler = set_exception_handler([$this, 'exceptionHandler']);
+
+        if (!$this->shutdownHandlerRegistered) {
+            /* Registered at most once per instance: PHP has no way to remove a shutdown function, so re-registering on
+               every register/unregister cycle in a worker would accumulate one callback per job for the life of the
+               process. The $globalHandlersRegistered flag is what arms and disarms it. */
+            register_shutdown_function([$this, 'shutdown']);
+
+            $this->shutdownHandlerRegistered = true;
+        }
+
+        $this->globalHandlersRegistered = true;
+    }
+
+    /**
+     * Removes the error and exception handlers installed by {@see registerGlobalHandlers()} and disarms the shutdown
+     * reporter, restoring whatever handling was in place before.
+     *
+     * Call this when the unit of work that owned the handlers ends — the end of a queue job, the end of a webhook
+     * request — so a later fatal is not attributed to a tenant that is no longer being served.
+     */
+    public function unregisterGlobalHandlers(): void
+    {
+        if (!$this->globalHandlersRegistered) {
+            return;
+        }
+
+        restore_error_handler();
+        restore_exception_handler();
+
+        $this->previousExceptionHandler = null;
+        $this->globalHandlersRegistered = false;
+    }
+
+    /**
+     * Runs the callback with this logger's global handlers installed, restoring the previous handling afterwards even
+     * if the callback throws.
+     *
+     * This is the shape a multi-tenant worker wants: the handlers are live for exactly the span in which this tenant is
+     * the one being served, so a fatal can only ever be reported under the identity that caused it.
+     *
+     * @template T
+     * @param callable(): T $callback The unit of work to run under this logger's handlers
+     *
+     * @return T Whatever the callback returns
+     */
+    public function withGlobalHandlers(callable $callback)
+    {
+        $this->registerGlobalHandlers();
+
+        try {
+            return $callback();
+        } finally {
+            $this->unregisterGlobalHandlers();
+        }
+    }
+
+    /**
+     * Installs this logger's PHP error, exception and shutdown handlers process-wide.
+     *
+     * @deprecated Use {@see registerGlobalHandlers()}, whose name says that the effect is process-global. This alias
+     *             is kept so existing plugin bootstraps keep working unchanged.
+     */
+    public function initHandlers(): void
+    {
+        $this->registerGlobalHandlers();
+    }
+
+    /**
+     * Returns true while this instance's global handlers are installed.
+     */
+    public function hasGlobalHandlers(): bool
+    {
+        return $this->globalHandlersRegistered;
+    }
+
+    /**
+     * Handles PHP shutdown.
+     *
+     * Reports nothing once {@see unregisterGlobalHandlers()} has run: the callback itself cannot be removed from PHP's
+     * shutdown list, so the registration flag is what decides whether this instance still speaks for the process.
+     */
+    public function shutdown(): void
+    {
+        if (!$this->globalHandlersRegistered) {
+            return;
+        }
+
+        if (($error = error_get_last()) !== null && ($error['type'] & self::CATCH_ERRORS_MASK) && !$this->isRethrownExceptionError($error)) {
+            $errorLevel = $this->getErrorTypeName($error['type']);
+
+            $this->sendError(
+                ErrorCategory::PhpError,
+                $this->mapErrorSeverity($error['type']),
+                OperationContext::Unknown,
+                $errorLevel,
+                "Error $errorLevel in $error[file]:$error[line]: $error[message]"
+            );
+        }
+
+        $this->unregisterGlobalHandlers();
+    }
+
+    /**
+     * The one redaction step every delivery branch of {@see sendError()} goes through (the dev-environment suppression, the queue and the
+     * direct send), so a branch added later cannot skip it - a queued payload sits in a database row until it drains.
+     *
+     * Redacts at the sink as well as at the source: a caller may pass a raw body (a PSR-18 network error carries the unsanitized request).
+     * The request is always this library's own payload, so anything unparseable is withheld; a response is redacted leniently, keeping an
+     * upstream HTML error page readable. A second pass masks values echoed in free text (an API validation message quoting the e-mail it
+     * rejected). The message and the stack trace are free text too - an exception message quotes upstream text - so they get the same
+     * free-text redaction.
+     *
+     * @return array{string, string|null, string|null, string|null} Message, stack trace, request body, response body
+     */
+    private function sanitizeForReport(string $message, ?string $stackTrace, ?string $apiRequest, ?string $apiResponse): array
+    {
+        return [
+            ExceptionSanitizer::redactText($message),
+            $stackTrace !== null ? ExceptionSanitizer::redactText($stackTrace) : null,
+            $apiRequest !== null ? $this->redactBody($apiRequest, true) : null,
+            $apiResponse !== null ? $this->redactBody($apiResponse, false) : null,
+        ];
+    }
+
+    /**
+     * Redacts a request or response body; an already-withheld body (the api-client placeholder) is returned as is.
+     */
+    private function redactBody(string $body, bool $failClosed): string
+    {
+        if (preg_match('/^\[REDACTED: \d+ bytes, not JSON\]$/', $body) === 1) {
+            return $body;
+        }
+
+        // A response that is a whole HTML page is reduced to its text first, which also shrinks what the redaction scans.
+        $body = $failClosed ? $body : (string) ResponseBodySummarizer::summarize($body);
+        $body = $failClosed ? ExceptionSanitizer::sanitizeExceptionBody($body) : ExceptionSanitizer::sanitizeBody($body);
+
+        return ($this->textSanitizer ??= new SensitiveDataProcessor())->sanitizeText($body);
+    }
+
+    /**
+     * Builds the PSR-3 context of the local log line: the bodies and trace in verbose mode, a correlation id otherwise.
+     *
+     * @return array<string, mixed>
+     */
+    private function buildLocalLogContext(ShopPluginError $error, ?string $apiRequest, ?string $apiResponse, ?string $stackTrace): array
+    {
+        if (!$this->verboseLocalLog) {
+            return ['report_id' => substr(sha1(serialize($error->toQueuePayload($this->serializer))), 0, 16)];
+        }
+
+        return array_filter(
+            ['api_request' => $apiRequest, 'api_response' => $apiResponse, 'trace' => $stackTrace],
+            static fn (?string $value): bool => $value !== null
+        );
+    }
+
+    /**
+     * Extracts caller context from the call stack.
+     *
+     * @param int $extraDepth Additional backtrace frames to skip beyond the standard SDK call stack. Pass 1 for each
+     *                        extra static facade layer between the real caller and sendError().
+     *
+     * @return array<string, mixed> Array with 'class', 'function', 'file', 'line' keys
+     */
+    private function extractCallerContext(int $extraDepth = 0): array
+    {
+        /* Standard frame layout when calling sendError() directly:
+             backtrace[0] = extractCallerContext
+             backtrace[1] = sendError (this method)
+             backtrace[2] = actual caller (target)
+           Each extra static facade layer between the caller and sendError() adds one frame ($extraDepth). */
+        $depth = 2 + $extraDepth;
+        $trace = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, $depth + 1);
+        $caller = $trace[$depth] ?? [];
+
+        return [
+            'class' => $caller['class'] ?? null,
+            'function' => $caller['function'] ?? null,
+            'file' => basename($caller['file'] ?? ''),
+            'line' => $caller['line'] ?? 0,
+        ];
+    }
+
+    /**
+     * Formats a context array into an error prefix string.
+     *
+     * @param array<string, mixed> $context Context array from extractCallerContext
+     *
+     * @return string Formatted context prefix like '[ClassName::method@file.php:123]'
+     */
+    private function formatContext(array $context): string
+    {
+        if (!empty($context['class'])) {
+            return sprintf(
+                '[%s::%s@%s:%d]',
+                substr(strrchr($context['class'], '\\'), 1),
+                $context['function'],
+                $context['file'],
+                $context['line']
+            );
+        }
+
+        return sprintf('[%s@%s:%d]', $context['function'], $context['file'], $context['line']);
+    }
+
+    /**
+     * Returns the error type name.
+     *
+     * @param int $errorType Error type numeric value
+     *
+     * @return string Error type name
+     */
+    private function getErrorTypeName(int $errorType): string
+    {
+        return self::ERROR_TYPES[$errorType] ?? 'UNKNOWN';
+    }
+
+    /**
+     * Maps a PHP error type to structured {@see ErrorSeverity}.
+     *
+     * @param int $errorType PHP error type constant
+     *
+     * @return ErrorSeverity The matching severity
+     */
+    private function mapErrorSeverity(int $errorType): ErrorSeverity
+    {
+        return match ($errorType) {
+            E_ERROR, E_CORE_ERROR, E_COMPILE_ERROR, E_RECOVERABLE_ERROR, E_PARSE, E_USER_ERROR => ErrorSeverity::Error,
+            E_WARNING, E_CORE_WARNING, E_COMPILE_WARNING, E_USER_WARNING => ErrorSeverity::Warning,
+            E_NOTICE, E_USER_NOTICE, E_DEPRECATED, E_USER_DEPRECATED => ErrorSeverity::Notice,
+            default => ErrorSeverity::Error,
+        };
+    }
+}
